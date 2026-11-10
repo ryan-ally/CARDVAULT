@@ -1,0 +1,12 @@
+{
+  "name": "cardvault-backend",
+  "type": "module",
+  "version": "1.0.0",
+  "private": true,
+  "scripts": {
+    "dev": "tsx watch server.ts",
+    "build": "tsc",
+    "start": "node dist/server.js"
+}
+
+}
