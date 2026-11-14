@@ -1,291 +1,941 @@
+
 import { createClient } from '@supabase/supabase-js';
 import cors from 'cors';
 import dotenv from 'dotenv';
 import express from 'express';
-import { randomUUID } from 'node:crypto';
+import { timingSafeEqual } from 'node:crypto';
 import Stripe from 'stripe';
 
 dotenv.config();
+
 const app = express();
 const port = Number(process.env.PORT) || 4242;
+
 const stripeKey = process.env.STRIPE_SECRET_KEY;
 const webhookSecret = process.env.STRIPE_WEBHOOK_SECRET;
 const supabaseUrl = process.env.SUPABASE_URL;
-const supabaseKey = process.env.SUPABASE_SERVICE_ROLE_KEY;
-const appUrl = process.env.APP_URL?.replace(/\/+$/, '');
+const supabaseServiceKey =
+  process.env.SUPABASE_SERVICE_ROLE_KEY;
+const appUrl =
+  process.env.APP_URL?.replace(/\/+$/, '');
+const cronSecret =
+  process.env.RESERVATION_CRON_SECRET;
 
-if (!stripeKey?.startsWith('sk_test_')) throw new Error('Set a valid Stripe test secret key');
-if (!supabaseUrl || !supabaseKey) throw new Error('Missing Supabase backend credentials');
-if (!appUrl || !/^https?:\/\/[^/]+/.test(appUrl)) throw new Error('Missing or invalid APP_URL');
-if (!webhookSecret) console.warn('STRIPE_WEBHOOK_SECRET is missing: payment confirmation will fail');
+if (!stripeKey?.startsWith('sk_test_')) {
+  throw new Error('Missing Stripe TEST secret key');
+}
+
+if (!webhookSecret?.startsWith('whsec_')) {
+  throw new Error(
+    'Missing hosted STRIPE_WEBHOOK_SECRET'
+  );
+}
+
+if (!supabaseUrl || !supabaseServiceKey) {
+  throw new Error(
+    'Missing Supabase backend credentials'
+  );
+}
+
+if (!appUrl || !/^https?:\/\/[^/]+$/.test(appUrl)) {
+  throw new Error('Invalid APP_URL');
+}
 
 const stripe = new Stripe(stripeKey);
-const supabase = createClient(supabaseUrl, supabaseKey, {
-  auth: { persistSession: false, autoRefreshToken: false },
-});
+
+const supabase = createClient(
+  supabaseUrl,
+  supabaseServiceKey,
+  {
+    auth: {
+      persistSession: false,
+      autoRefreshToken: false,
+    },
+  }
+);
+
 const SHIPPING_CENTS = 599;
+const RESERVATION_SECONDS = 30 * 60;
 
-// IMPORTANT: webhook MUST receive the raw body, before express.json().
-app.post('/stripe-webhook', express.raw({ type: 'application/json' }), async (req, res) => {
-  if (!webhookSecret) { res.status(503).send('Webhook secret not configured'); return; }
-  const signature = req.headers['stripe-signature'];
-  if (typeof signature !== 'string') { res.status(400).send('Missing Stripe signature'); return; }
+type LineItem = {
+  product_id: string;
+  name: string;
+  price: number;
+  quantity: number;
+};
 
-  let event: Stripe.Event;
-  try {
-    event = stripe.webhooks.constructEvent(req.body, signature, webhookSecret);
-  } catch (error) {
-    console.error('Stripe webhook signature verification failed:', error);
-    res.status(400).send('Invalid signature');
-    return;
+type Customer = {
+  name?: string;
+  email?: string;
+  address?: string;
+  city?: string;
+  state?: string;
+  zip?: string;
+};
+
+async function authenticate(
+  header: string | undefined
+) {
+  if (!header?.startsWith('Bearer ')) {
+    return null;
   }
 
-  if (event.type !== 'checkout.session.completed' &&
-    event.type !== 'checkout.session.async_payment_succeeded') {
-    res.json({ received: true, ignored: true });
-    return;
+  const { data, error } =
+    await supabase.auth.getUser(header.slice(7));
+
+  return error ? null : data.user;
+}
+
+async function rpcRequired<T = unknown>(
+  name: string,
+  args: Record<string, unknown>
+): Promise<T> {
+  const { data, error } =
+    await supabase.rpc(name, args);
+
+  if (error) {
+    throw new Error(`${name}: ${error.message}`);
   }
 
-  try {
-    const session = event.data.object as Stripe.Checkout.Session;
-    const orderId = session.metadata?.order_id;
-    const paymentIntentId = typeof session.payment_intent === 'string'
+  return data as T;
+}
+
+// Attach Stripe session to reserved order
+async function attach(
+  session: Stripe.Checkout.Session,
+  orderId: string
+) {
+  await rpcRequired(
+    'attach_cardvault_checkout_session',
+    {
+      p_order_id: orderId,
+      p_session_id: session.id,
+      p_expires_at: new Date(
+        session.expires_at * 1000
+      ).toISOString(),
+    }
+  );
+}
+
+// Complete a successfully paid reservation
+async function completePaidSession(
+  session: Stripe.Checkout.Session,
+  eventId: string
+) {
+  const orderId = session.metadata?.order_id;
+
+  const paymentIntentId =
+    typeof session.payment_intent === 'string'
       ? session.payment_intent
       : session.payment_intent?.id;
 
-    if (session.mode !== 'payment' || session.payment_status !== 'paid' ||
-      session.currency?.toLowerCase() !== 'usd' ||
-      !orderId || !paymentIntentId ||
-      !Number.isSafeInteger(session.amount_total) || session.amount_total! < 1) {
-      throw new Error(`Unverifiable paid session ${session.id}`);
-    }
+  if (
+    session.mode !== 'payment' ||
+    session.payment_status !== 'paid' ||
+    session.currency?.toLowerCase() !== 'usd' ||
+    !orderId ||
+    !paymentIntentId ||
+    !Number.isSafeInteger(session.amount_total) ||
+    !session.amount_total ||
+    session.amount_total < SHIPPING_CENTS
+  ) {
+    throw new Error(
+      `Invalid paid Stripe session ${session.id}`
+    );
+  }
 
-    // SQL RPC locks the order, checks total, deducts stock and marks paid
-    // in one transaction. Repeated events return already_paid.
-    const { data, error } = await supabase.rpc('complete_cardvault_stripe_order', {
+  const { data: order, error: orderError } =
+    await supabase
+      .from('orders')
+      .select(
+        'reservation_state,stripe_checkout_session_id,payment_status'
+      )
+      .eq('id', orderId)
+      .single();
+
+  if (orderError) throw orderError;
+
+  if (
+    order.reservation_state === 'held' &&
+    !order.stripe_checkout_session_id
+  ) {
+    await attach(session, orderId);
+  }
+
+  const result = await rpcRequired<string>(
+    'complete_cardvault_stripe_order',
+    {
       p_order_id: orderId,
       p_session_id: session.id,
       p_payment_intent_id: paymentIntentId,
       p_amount_cents: session.amount_total,
-      p_event_id: event.id,
-    });
-    if (error) throw error;
-    console.log('Stripe order result:', { orderId, result: data });
-    res.json({ received: true });
-  } catch (error) {
-    // Return non-2xx so Stripe retries. Alert/resolve paid-but-out-of-stock
-    // cases; never silently mark them fulfilled.
-    console.error('ACTION REQUIRED: paid checkout could not be finalized:', event.id, error);
-    res.status(500).send('Order processing failed');
+      p_event_id: eventId,
+    }
+  );
+
+  console.log(
+    'CardVault paid order:',
+    orderId,
+    result
+  );
+}
+
+// Release stock for expired or failed checkout
+async function releaseStripeSession(
+  session: Stripe.Checkout.Session
+) {
+  const orderId = session.metadata?.order_id;
+
+  if (!orderId) {
+    throw new Error(
+      `Missing order metadata: ${session.id}`
+    );
   }
-});
+
+  if (session.payment_status === 'paid') {
+    throw new Error(
+      'Cannot release a paid Checkout session'
+    );
+  }
+
+  const { data: existing, error } =
+    await supabase
+      .from('orders')
+      .select(
+        'reservation_state,stripe_checkout_session_id'
+      )
+      .eq('id', orderId)
+      .single();
+
+  if (error) throw error;
+
+  if (
+    existing.reservation_state === 'held' &&
+    !existing.stripe_checkout_session_id
+  ) {
+    await attach(session, orderId);
+  }
+
+  const result = await rpcRequired<string>(
+    'release_cardvault_reservation',
+    {
+      p_order_id: orderId,
+      p_session_id: session.id,
+    }
+  );
+
+  console.log(
+    'CardVault reservation released:',
+    orderId,
+    result
+  );
+}
+
+// ==========================================
+// STRIPE WEBHOOK
+// Must be before express.json middleware.
+// ==========================================
+
+app.post(
+  '/stripe-webhook',
+  express.raw({ type: 'application/json' }),
+  async (req, res) => {
+    const signature = req.header(
+      'stripe-signature'
+    );
+
+    if (!signature) {
+      res.status(400).send(
+        'Missing Stripe signature'
+      );
+      return;
+    }
+
+    let event: Stripe.Event;
+
+    try {
+      event = stripe.webhooks.constructEvent(
+        req.body,
+        signature,
+        webhookSecret
+      );
+    } catch (error) {
+      console.error(
+        'Invalid webhook signature:',
+        error
+      );
+
+      res.status(400).send(
+        'Invalid webhook signature'
+      );
+      return;
+    }
+
+    try {
+      if (
+        event.type ===
+        'checkout.session.completed' ||
+        event.type ===
+        'checkout.session.async_payment_succeeded'
+      ) {
+        const session =
+          event.data.object as Stripe.Checkout.Session;
+
+        if (session.payment_status === 'paid') {
+          await completePaidSession(
+            session,
+            event.id
+          );
+        } else {
+          console.log(
+            'Checkout awaiting payment:',
+            session.id
+          );
+        }
+      } else if (
+        event.type === 'checkout.session.expired'
+      ) {
+        await releaseStripeSession(
+          event.data.object as Stripe.Checkout.Session
+        );
+      } else if (
+        event.type ===
+        'checkout.session.async_payment_failed'
+      ) {
+        const session =
+          event.data.object as Stripe.Checkout.Session;
+
+        if (session.payment_status !== 'paid') {
+          await releaseStripeSession(session);
+        }
+      }
+
+      res.json({ received: true });
+    } catch (error) {
+      console.error(
+        'ACTION REQUIRED: Stripe webhook failed:',
+        event.id,
+        error
+      );
+
+      // Stripe should retry failed processing.
+      res.status(500).send(
+        'Webhook processing failed'
+      );
+    }
+  }
+);
 
 app.use(cors());
 app.use(express.json({ limit: '100kb' }));
 
-app.get('/health', (_req, res) => res.json({ status: 'ok', service: 'CardVault payments' }));
+// ==========================================
+// HEALTH CHECK
+// ==========================================
+
+app.get('/health', (_req, res) => {
+  res.json({
+    status: 'ok',
+    service: 'CardVault payments',
+  });
+});
+
+// ==========================================
+// MARKET PRICE LOOKUP
+// ==========================================
 
 app.get('/market-price', async (req, res) => {
   try {
     const apiKey = process.env.TCGAPI_KEY;
-    if (!apiKey) { res.status(500).json({ error: 'Market price API is not configured' }); return; }
-    const query = typeof req.query.q === 'string' ? req.query.q.trim() : '';
-    const setName = typeof req.query.set === 'string' ? req.query.set.trim() : '';
-    const cardNumber = typeof req.query.number === 'string' ? req.query.number.trim() : '';
-    if (query.length < 2) { res.status(400).json({ error: 'Enter at least two characters' }); return; }
-    const params = new URLSearchParams({ q: query, game: 'pokemon', per_page: '20' });
-    const response = await fetch(`https://api.tcgapi.dev/v1/search?${params}`, {
-      headers: { 'X-API-Key': apiKey },
+
+    if (!apiKey) {
+      res.status(500).json({
+        error: 'Market price API is not configured',
+      });
+      return;
+    }
+
+    const query =
+      typeof req.query.q === 'string'
+        ? req.query.q.trim()
+        : '';
+
+    const setName =
+      typeof req.query.set === 'string'
+        ? req.query.set.trim()
+        : '';
+
+    const number =
+      typeof req.query.number === 'string'
+        ? req.query.number.trim()
+        : '';
+
+    if (query.length < 2) {
+      res.status(400).json({
+        error: 'Enter at least two characters',
+      });
+      return;
+    }
+
+    const params = new URLSearchParams({
+      q: query,
+      game: 'pokemon',
+      per_page: '20',
     });
-    if (!response.ok) { res.status(502).json({ error: 'Market price lookup failed' }); return; }
-    const result = await response.json() as {
-      data?: Array<{
-        id: number; name: string; set_name?: string; number?: string;
-        rarity?: string; market_price?: number | null; market_price_as_of?: string | null;
-        price_updated_at?: string | null; printing?: string; image_url?: string;
-      }>
+
+    const response = await fetch(
+      `https://api.tcgapi.dev/v1/search?${params}`,
+      {
+        headers: {
+          'X-API-Key': apiKey,
+        },
+      }
+    );
+
+    if (!response.ok) {
+      res.status(502).json({
+        error: 'Market price lookup failed',
+      });
+      return;
+    }
+
+    const result = (await response.json()) as {
+      data?: {
+        id: number;
+        name: string;
+        set_name?: string;
+        number?: string;
+        rarity?: string;
+        market_price?: number | null;
+        market_price_as_of?: string;
+        price_updated_at?: string;
+        printing?: string;
+        image_url?: string;
+      }[];
     };
+
     let matches = result.data ?? [];
-    if (setName) matches = matches.filter(c => c.set_name?.toLowerCase() === setName.toLowerCase());
-    if (cardNumber) matches = matches.filter(c => c.number?.toLowerCase() === cardNumber.toLowerCase());
+
+    if (setName) {
+      matches = matches.filter(
+        card =>
+          card.set_name?.toLowerCase() ===
+          setName.toLowerCase()
+      );
+    }
+
+    if (number) {
+      matches = matches.filter(
+        card =>
+          card.number?.toLowerCase() ===
+          number.toLowerCase()
+      );
+    }
+
     res.json({
-      data: matches.map(c => ({
-        id: c.id, name: c.name, setName: c.set_name ?? null,
-        cardNumber: c.number ?? null, rarity: c.rarity ?? null,
-        printing: c.printing ?? null, marketPrice: c.market_price ?? null,
-        priceAsOf: c.market_price_as_of ?? c.price_updated_at ?? null,
-        imageUrl: c.image_url ?? null,
-      }))
+      data: matches.map(card => ({
+        id: card.id,
+        name: card.name,
+        setName: card.set_name ?? null,
+        cardNumber: card.number ?? null,
+        rarity: card.rarity ?? null,
+        printing: card.printing ?? null,
+        marketPrice:
+          card.market_price ?? null,
+        priceAsOf:
+          card.market_price_as_of ??
+          card.price_updated_at ??
+          null,
+        imageUrl:
+          card.image_url ?? null,
+      })),
     });
   } catch (error) {
-    console.error('Market price error:', error);
-    res.status(500).json({ error: 'Unable to retrieve market prices' });
+    console.error(
+      'Market price lookup failed:',
+      error
+    );
+
+    res.status(500).json({
+      error: 'Unable to retrieve market prices',
+    });
   }
 });
 
-async function authenticate(authorization: string | undefined) {
-  if (!authorization?.startsWith('Bearer ')) return null;
-  const { data, error } = await supabase.auth.getUser(authorization.slice(7));
-  return error ? null : data.user;
-}
+// ==========================================
+// INVENTORY CONNECTION TEST
+// ==========================================
 
 app.get('/inventory-test', async (req, res) => {
   try {
-    const user = await authenticate(req.headers.authorization);
-    if (!user) { res.status(401).json({ error: 'Please sign in before checking inventory' }); return; }
-    const { data, error } = await supabase.from('inventory').select('id, name, price, quantity').limit(10);
+    const user = await authenticate(
+      req.headers.authorization
+    );
+
+    if (!user) {
+      res.status(401).json({
+        error: 'Sign in required',
+      });
+      return;
+    }
+
+    const { data, error } = await supabase
+      .from('inventory')
+      .select(
+        'id,name,price,quantity,reserved_quantity'
+      )
+      .limit(10);
+
     if (error) throw error;
-    res.json({ connected: true, inventory: data });
+
+    res.json({
+      connected: true,
+      inventory: data,
+    });
   } catch (error) {
-    console.error('Inventory connection error:', error);
-    res.status(500).json({ error: 'Inventory connection failed' });
+    console.error(
+      'Inventory test failed:',
+      error
+    );
+
+    res.status(500).json({
+      error: 'Inventory test failed',
+    });
   }
 });
 
-type CartInput = { id: string; quantity: number };
-type InventoryCard = {
-  id: string; name: string; price: number | string; quantity: number; is_active: boolean;
-  set_name: string; card_number: string; image: string; condition: string; category: string;
-};
+// ==========================================
+// DISABLE LEGACY PAYMENT INTENTS
+// ==========================================
 
-async function verifyCart(input: unknown) {
-  if (!Array.isArray(input) || input.length < 1 || input.length > 50) throw new Error('Invalid cart');
-  const quantities = new Map<string, number>();
-  for (const item of input as CartInput[]) {
-    if (!item || typeof item.id !== 'string' || !item.id.trim() ||
-      !Number.isInteger(item.quantity) || item.quantity < 1 || item.quantity > 20) {
-      throw new Error('Invalid cart item');
-    }
-    const next = (quantities.get(item.id) ?? 0) + item.quantity;
-    if (next > 20) throw new Error('Quantity limit exceeded');
-    quantities.set(item.id, next);
+// Older payment-intent checkout does not
+// reserve stock. Use hosted Stripe Checkout.
+
+app.post(
+  '/create-payment-intent',
+  (_req, res) => {
+    res.status(410).json({
+      error:
+        'Use /create-checkout-session for reserved CardVault orders',
+    });
   }
-  const { data, error } = await supabase.from('inventory')
-    .select('id,name,price,quantity,is_active,set_name,card_number,image,condition,category')
-    .in('id', [...quantities.keys()]);
-  if (error) throw error;
-  const cards = (data ?? []) as InventoryCard[];
-  if (cards.length !== quantities.size) throw new Error('One or more cards are unavailable');
-  let subtotalCents = 0;
-  const lines = cards.map(card => {
-    const quantity = quantities.get(card.id)!;
-    if (card.is_active !== true || !Number.isInteger(card.quantity) || card.quantity < quantity) {
-      throw new Error(`${card.name} is sold out or unavailable`);
+);
+
+// ==========================================
+// CREATE STRIPE CHECKOUT SESSION
+// ==========================================
+
+app.post(
+  '/create-checkout-session',
+  async (req, res) => {
+    let orderId: string | undefined;
+    let startedStripeCreation = false;
+
+    try {
+      const user = await authenticate(
+        req.headers.authorization
+      );
+
+      if (!user) {
+        res.status(401).json({
+          error: 'Sign in before checkout',
+        });
+        return;
+      }
+
+      const customer =
+        (req.body?.customer ?? {}) as Customer;
+
+      if (
+        !customer.name?.trim() ||
+        !customer.email?.trim() ||
+        !customer.address?.trim() ||
+        !customer.city?.trim() ||
+        !customer.state?.trim() ||
+        !customer.zip?.trim()
+      ) {
+        res.status(400).json({
+          error: 'Complete shipping details',
+        });
+        return;
+      }
+
+      // Supabase atomically checks stock,
+      // reserves inventory, and creates
+      // a pending order and its items.
+
+      const held = await rpcRequired<{
+        order_id: string;
+        total_cents: number;
+      }>(
+        'reserve_cardvault_order',
+        {
+          p_user_id: user.id,
+          p_items: req.body.items,
+          p_customer_name: customer.name,
+          p_email: customer.email,
+          p_address: customer.address,
+          p_city: customer.city,
+          p_state: customer.state,
+          p_zip: customer.zip,
+        }
+      );
+
+      orderId = held.order_id;
+
+      const { data: lines, error: linesError } =
+        await supabase
+          .from('order_items')
+          .select(
+            'product_id,name,price,quantity'
+          )
+          .eq('order_id', orderId);
+
+      if (linesError) throw linesError;
+
+      const items =
+        (lines ?? []) as LineItem[];
+
+      if (!items.length) {
+        throw new Error(
+          'Reserved order has no items'
+        );
+      }
+
+      // Stripe prices use trusted
+      // database snapshots, not cart prices.
+
+      const lineItems:
+        Stripe.Checkout.SessionCreateParams.LineItem[] =
+        items.map(line => ({
+          price_data: {
+            currency: 'usd',
+            product_data: {
+              name: line.name,
+            },
+            unit_amount: Math.round(
+              Number(line.price) * 100
+            ),
+          },
+          quantity: line.quantity,
+        }));
+
+      const expectedTotal = items.reduce(
+        (sum, item) =>
+          sum +
+          Math.round(Number(item.price) * 100) *
+          item.quantity,
+        SHIPPING_CENTS
+      );
+
+      if (
+        expectedTotal !==
+        Number(held.total_cents)
+      ) {
+        throw new Error(
+          'Order total does not match database snapshot'
+        );
+      }
+
+      // Stripe requires the expiration
+      // to be at least 30 minutes ahead.
+      // Small buffer avoids request latency
+      // making the expiry too early.
+      const expiresAt =
+        Math.floor(Date.now() / 1000) +
+        RESERVATION_SECONDS +
+        60;
+
+      startedStripeCreation = true;
+
+      const stripeSession =
+        await stripe.checkout.sessions.create(
+          {
+            mode: 'payment',
+
+            customer_email:
+              customer.email.trim(),
+
+            line_items: lineItems,
+
+            expires_at: expiresAt,
+
+            shipping_options: [
+              {
+                shipping_rate_data: {
+                  type: 'fixed_amount',
+                  fixed_amount: {
+                    amount: SHIPPING_CENTS,
+                    currency: 'usd',
+                  },
+                  display_name:
+                    'Standard shipping',
+                },
+              },
+            ],
+
+            success_url:
+              `${appUrl}/checkout-success?session_id={CHECKOUT_SESSION_ID}`,
+
+            cancel_url:
+              `${appUrl}/checkout`,
+
+            client_reference_id:
+              user.id,
+
+            metadata: {
+              order_id: orderId,
+              customer_id: user.id,
+              environment: 'test',
+            },
+
+            payment_intent_data: {
+              metadata: {
+                order_id: orderId,
+                customer_id: user.id,
+                environment: 'test',
+              },
+            },
+          },
+          {
+            idempotencyKey:
+              `cv-reservation-${orderId}`,
+          }
+        );
+
+      if (!stripeSession.url) {
+        throw new Error(
+          'Stripe did not return a checkout URL'
+        );
+      }
+
+      await attach(
+        stripeSession,
+        orderId
+      );
+
+      res.json({
+        url: stripeSession.url,
+        orderId,
+        expiresAt:
+          stripeSession.expires_at,
+      });
+    } catch (error) {
+      console.error(
+        'Create checkout failed:',
+        { orderId, error }
+      );
+
+      // Release only if Stripe session
+      // creation was never attempted.
+      // A network timeout could mean
+      // Stripe created a session.
+
+      if (
+        orderId &&
+        !startedStripeCreation
+      ) {
+        try {
+          await rpcRequired(
+            'release_cardvault_reservation',
+            {
+              p_order_id: orderId,
+              p_session_id: null,
+            }
+          );
+        } catch (releaseError) {
+          console.error(
+            'Reservation cleanup failed:',
+            releaseError
+          );
+        }
+      }
+
+      res.status(500).json({
+        error:
+          error instanceof Error
+            ? error.message
+            : 'Unable to start checkout',
+      });
     }
-    const price = Number(card.price);
-    const unitCents = Math.round(price * 100);
-    if (!Number.isFinite(price) || !Number.isSafeInteger(unitCents) || unitCents <= 0) {
-      throw new Error('Invalid inventory price');
-    }
-    subtotalCents += unitCents * quantity;
-    return { card, quantity, unitCents };
-  });
-  if (!Number.isSafeInteger(subtotalCents) || subtotalCents + SHIPPING_CENTS > 99999999) {
-    throw new Error('Invalid payment total');
   }
-  return { lines, subtotalCents };
+);
+
+// ==========================================
+// SECURE CRON AUTHENTICATION
+// ==========================================
+
+function secretMatches(
+  actual: string | undefined,
+  expected: string
+) {
+  if (!actual) return false;
+
+  const a = Buffer.from(actual);
+  const b = Buffer.from(expected);
+
+  return (
+    a.length === b.length &&
+    timingSafeEqual(a, b)
+  );
 }
 
-// Kept for compatibility with your earlier native payment-intent test.
-app.post('/create-payment-intent', async (req, res) => {
-  try {
-    const user = await authenticate(req.headers.authorization);
-    if (!user) { res.status(401).json({ error: 'Please sign in before checkout' }); return; }
-    const { subtotalCents } = await verifyCart(req.body?.items);
-    const paymentIntent = await stripe.paymentIntents.create({
-      amount: subtotalCents + SHIPPING_CENTS, currency: 'usd',
-      automatic_payment_methods: { enabled: true },
-      metadata: { customer_id: user.id, environment: 'test', flow: 'legacy_payment_intent' },
-    });
-    res.json({ clientSecret: paymentIntent.client_secret, totalCents: subtotalCents + SHIPPING_CENTS });
-  } catch (error) {
-    console.error('Payment intent error:', error);
-    res.status(400).json({ error: error instanceof Error ? error.message : 'Unable to initialize payment' });
-  }
-});
+// ==========================================
+// RECONCILE EXPIRED RESERVATIONS
+// ==========================================
 
-app.post('/create-checkout-session', async (req, res) => {
-  let pendingOrderId: string | null = null;
-  let stripeSessionCreated = false;
-  try {
-    const user = await authenticate(req.headers.authorization);
-    if (!user) { res.status(401).json({ error: 'Please sign in first' }); return; }
-    const customer = req.body?.customer;
-    if (!customer || typeof customer.name !== 'string' || !customer.name.trim() ||
-      typeof customer.email !== 'string' || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(customer.email.trim()) ||
-      typeof customer.address !== 'string' || !customer.address.trim() ||
-      typeof customer.city !== 'string' || !customer.city.trim() ||
-      typeof customer.state !== 'string' || !/^[A-Za-z]{2}$/.test(customer.state.trim()) ||
-      typeof customer.zip !== 'string' || !/^\d{5}(-\d{4})?$/.test(customer.zip.trim())) {
-      res.status(400).json({ error: 'Invalid shipping details' }); return;
+app.post(
+  '/internal/reconcile-reservations',
+  async (req, res) => {
+    if (
+      !cronSecret ||
+      !secretMatches(
+        req.header('x-cron-secret'),
+        cronSecret
+      )
+    ) {
+      res.status(401).json({
+        error: 'Unauthorized',
+      });
+      return;
     }
 
-    const { lines, subtotalCents } = await verifyCart(req.body?.items);
-    const orderId = randomUUID();
-    const orderNumber = `CV-${orderId.slice(0, 8).toUpperCase()}`;
-    const totalCents = subtotalCents + SHIPPING_CENTS;
+    try {
+      const { data, error } =
+        await supabase
+          .from('orders')
+          .select(
+            'id,stripe_checkout_session_id,reservation_expires_at'
+          )
+          .eq('reservation_state', 'held')
+          .lt(
+            'reservation_expires_at',
+            new Date().toISOString()
+          )
+          .order(
+            'reservation_expires_at',
+            { ascending: true }
+          )
+          .limit(40);
 
-    const { error: orderError } = await supabase.from('orders').insert({
-      id: orderId, user_id: user.id, order_number: orderNumber,
-      customer_name: customer.name.trim(), email: customer.email.trim(),
-      total: totalCents / 100, status: 'processing', payment_status: 'pending',
-      shipping_address: customer.address.trim(), shipping_city: customer.city.trim(),
-      shipping_state: customer.state.trim().toUpperCase(), shipping_postal_code: customer.zip.trim(),
-    });
-    if (orderError) throw orderError;
-    pendingOrderId = orderId;
+      if (error) throw error;
 
-    const { error: itemsError } = await supabase.from('order_items').insert(
-      lines.map(({ card, quantity, unitCents }) => ({
-        order_id: orderId, product_id: card.id, name: card.name,
-        set_name: card.set_name, card_number: card.card_number,
-        price: unitCents / 100, quantity, image: card.image,
-        condition: card.condition, category: card.category,
-      }))
-    );
-    if (itemsError) throw itemsError;
+      const results: {
+        order: string;
+        result: string;
+      }[] = [];
 
-    const session = await stripe.checkout.sessions.create({
-mode:'payment',
-      customer_email: customer.email.trim(),
-      line_items: lines.map(({ card, quantity, unitCents }) => ({
-        price_data: { currency: 'usd', product_data: { name: card.name }, unit_amount: unitCents },
-        quantity,
-      })),
-      shipping_options: [{
-        shipping_rate_data: {
-          type: 'fixed_amount', fixed_amount: { amount: SHIPPING_CENTS, currency: 'usd' },
-          display_name: 'Standard shipping',
+      for (const order of data ?? []) {
+        try {
+          if (
+            !order.stripe_checkout_session_id
+          ) {
+            console.error(
+              'ACTION REQUIRED: unlinked reservation',
+              order.id
+            );
+
+            results.push({
+              order: order.id,
+              result: 'manual_review_unlinked',
+            });
+
+            continue;
+          }
+
+          let stripeSession =
+            await stripe.checkout.sessions.retrieve(
+              order.stripe_checkout_session_id
+            );
+
+          if (
+            stripeSession.payment_status === 'paid'
+          ) {
+            await completePaidSession(
+              stripeSession,
+              `reconcile-${stripeSession.id}`
+            );
+
+            results.push({
+              order: order.id,
+              result: 'paid_finalized',
+            });
+          } else if (
+            stripeSession.status === 'expired'
+          ) {
+            await releaseStripeSession(
+              stripeSession
+            );
+
+            results.push({
+              order: order.id,
+              result: 'released',
+            });
+          } else if (
+            stripeSession.status === 'open' &&
+            stripeSession.expires_at <=
+            Math.floor(Date.now() / 1000)
+          ) {
+            // Expire in Stripe first,
+            // then release database stock.
+
+            stripeSession =
+              await stripe.checkout.sessions.expire(
+                stripeSession.id
+              );
+
+            await releaseStripeSession(
+              stripeSession
+            );
+
+            results.push({
+              order: order.id,
+              result: 'expired_and_released',
+            });
+          } else {
+            results.push({
+              order: order.id,
+              result:
+                'awaiting_payment_or_expiry',
+            });
+          }
+        } catch (error) {
+          console.error(
+            'ACTION REQUIRED: reconciliation error',
+            order.id,
+            error
+          );
+
+          results.push({
+            order: order.id,
+            result: 'error_manual_review',
+          });
         }
-      }],
-      success_url: `${appUrl}/checkout-success?session_id={CHECKOUT_SESSION_ID}`,
-      cancel_url: `${appUrl}/checkout`,
-      client_reference_id: user.id,
-      metadata: { order_id: orderId, customer_id: user.id, environment: 'test' },
-      payment_intent_data: { metadata: { order_id: orderId, customer_id: user.id, environment: 'test' } },
-    }, { idempotencyKey: `cardvault-checkout-${orderId}` });
-    stripeSessionCreated = true;
-    if (!session.url) throw new Error('Stripe did not return a checkout URL');
+      }
 
-    const { error: linkError } = await supabase.from('orders')
-      .update({ stripe_checkout_session_id: session.id })
-      .eq('id', orderId).eq('payment_status', 'pending');
-    if (linkError) throw linkError;
+      res.json({
+        checked: results.length,
+        results,
+      });
+    } catch (error) {
+      console.error(
+        'Reservation reconciliation failed:',
+        error
+      );
 
-    res.json({ url: session.url, orderId });
-  } catch (error) {
-    console.error('Checkout session error:', error);
-    // Clean up only if no Stripe session was created. Once created,
-    // leave pending records for reconciliation rather than deleting them.
-    if (pendingOrderId && !stripeSessionCreated) {
-      const { error: cleanupError } = await supabase.from('orders').delete()
-        .eq('id', pendingOrderId).eq('payment_status', 'pending');
-      if (cleanupError) console.error('Pending-order cleanup failed:', cleanupError);
+      res.status(500).json({
+        error: 'Reconciliation failed',
+      });
     }
-    res.status(500).json({ error: error instanceof Error ? error.message : 'Could not start Stripe Checkout' });
   }
-});
+);
+
+// ==========================================
+// START CARDVAULT BACKEND
+// ==========================================
 
 app.listen(port, '0.0.0.0', () => {
-  console.log(`CardVault payment server listening on port ${port}`);
+  console.log(
+    `CardVault payment server listening on port ${port}`
+  );
 });
